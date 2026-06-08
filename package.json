@@ -1,0 +1,42 @@
+{
+  "name": "cse-code-buddy",
+  "displayName": "CSE Code Buddy",
+  "description": "A high-end, professional AI assistant for coding, debugging, and computer science concepts.",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Education",
+    "Linters"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cse-code-buddy.openChat",
+        "title": "Open CSE Code Buddy"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "cse-code-buddy.openChat",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.x.x",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}
