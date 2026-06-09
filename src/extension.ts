@@ -1,3 +1,4 @@
+// Previous Chat Preserved
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,6 +10,12 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
+interface ChatMessage {
+    role: 'user' | 'assistant';
+    text: string;
+    timestamp: string;
+}
+
 class ChatPanel {
     public static currentPanel: ChatPanel | undefined;
     public static readonly viewType = 'cseChatView';
@@ -16,7 +23,7 @@ class ChatPanel {
     private readonly _extensionUri: vscode.Uri;
     private _disposables: vscode.Disposable[] = [];
     private _apiKey: string = '';
-    private _chatHistory: { role: string, content: string }[] = [];
+    private _agentContextHistory: { role: string, content: string }[] = [];
 
     public static createOrShow(extensionUri: vscode.Uri) {
         if (ChatPanel.currentPanel) {
@@ -45,6 +52,9 @@ class ChatPanel {
         this._panel.webview.onDidReceiveMessage(
             async (message) => {
                 switch (message.command) {
+                    case 'initialized':
+                        this._loadAndDisplayHistory();
+                        return;
                     case 'saveKey':
                         this._apiKey = message.key.trim();
                         vscode.window.showInformationMessage('Groq API Key updated successfully.');
@@ -54,6 +64,8 @@ class ChatPanel {
                             this._panel.webview.postMessage({ command: 'error', text: 'Please enter a valid Groq API Key first.' });
                             return;
                         }
+                        // Save user message locally first
+                        this._saveMessageToDisk('user', message.text, message.timestamp);
                         await this._runAgentEngine(message.text);
                         return;
                 }
@@ -67,9 +79,47 @@ class ChatPanel {
         return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     }
 
+    private _getHistoryFilePath(): string | undefined {
+        const root = this._getWorkspaceRoot();
+        if (!root) return undefined;
+        return path.join(root, '.code_buddy_history.json');
+    }
+
+    // Read full historical transcript from local workspace JSON database
+    private _getSavedHistory(): ChatMessage[] {
+        const filePath = this._getHistoryFilePath();
+        if (!filePath || !fs.existsSync(filePath)) return [];
+        try {
+            const data = fs.readFileSync(filePath, 'utf8');
+            return JSON.parse(data) as ChatMessage[];
+        } catch {
+            return [];
+        }
+    }
+
+    // Save message logs right to disk
+    private _saveMessageToDisk(role: 'user' | 'assistant', text: string, timestamp: string) {
+        const filePath = this._getHistoryFilePath();
+        if (!filePath) return;
+        const history = this._getSavedHistory();
+        history.push({ role, text, timestamp });
+        try {
+            fs.writeFileSync(filePath, JSON.stringify(history, null, 2), 'utf8');
+        } catch (err) {
+            console.error("Failed to write chat log history file", err);
+        }
+    }
+
+    // Sends saved history arrays back to UI panel at bootup
+    private _loadAndDisplayHistory() {
+        const history = this._getSavedHistory();
+        if (history.length > 0) {
+            this._panel.webview.postMessage({ command: 'loadHistory', history: history });
+        }
+    }
+
     // Agent Engine Loop
     private async _runAgentEngine(userMessage: string) {
-        // --- Scenario B Hardcoded Logic Guardrail ---
         const lowerMessage = userMessage.toLowerCase();
         const restrictedKeywords = [
             'medicine', 'prescription', 'doctor', 'medical', 'headache', 'migraine', 
@@ -79,17 +129,22 @@ class ChatPanel {
         const containsRestricted = restrictedKeywords.some(keyword => lowerMessage.includes(keyword));
         if (containsRestricted) {
             const blockedResponse = "I am optimized exclusively for computer science, software engineering, and programming inquiries. I cannot provide assistance on this topic.";
-            this._panel.webview.postMessage({ command: 'aiResponse', text: blockedResponse });
+            const fallbackTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            
+            this._panel.webview.postMessage({ command: 'aiResponse', text: blockedResponse, timestamp: fallbackTime });
+            this._saveMessageToDisk('assistant', blockedResponse, fallbackTime);
             return;
         }
-        // ---------------------------------------------
 
-        // Reset chat history tracking for a clean task run loop
-        this._chatHistory = [];
+        // Token Guardrail: Pull only the LAST 10 conversations from disk to protect Groq TPM bounds
+        const fullHistory = this._getSavedHistory();
+        const optimizedRecentHistory = fullHistory.slice(-10);
+
+        this._agentContextHistory = [];
         
         const systemPrompt = `You are an elite Software Engineering Agent. Your task is to analyze user requests and interact with local workspace files using automated thoughts. 
 CRITICAL FOCUS & SCOPE RULE:
-You are optimized exclusively for computer science, software engineering, IT, and programming inquiries. If a user asks a question outside of this technical scope (such as medicine, law, history, cooking, etc.), you MUST decline to answer. In such cases, ignore the tool-calling options and return a final response stating: "I am optimized exclusively for computer science, software engineering, and programming inquiries. I cannot provide assistance on out-of-scope topics."
+You are optimized exclusively for computer science, software engineering, IT, and programming inquiries. If a user asks a question outside of this technical scope, you MUST decline to answer. In such cases, ignore tool options and return a final response stating: "I am optimized exclusively for computer science, software engineering, and programming inquiries. I cannot provide assistance on out-of-scope topics."
 CRITICAL FORMATTING RULE:
 You must ALWAYS respond in a strict JSON format. Do not include any text outside the JSON object. Do not use markdown blocks (\`\`\`json) in your overall response. Just return the raw JSON object.
 
@@ -117,8 +172,15 @@ JSON Response Schema Options:
     "message": "Your complete final analysis or explanation in markdown format."
 }`;
 
-        this._chatHistory.push({ role: 'system', content: systemPrompt });
-        this._chatHistory.push({ role: 'user', content: userMessage });
+        this._agentContextHistory.push({ role: 'system', content: systemPrompt });
+        
+        // Feed the model the optimized sliding conversational parameters context
+        optimizedRecentHistory.forEach(msg => {
+            this._agentContextHistory.push({ 
+                role: msg.role === 'user' ? 'user' : 'assistant', 
+                content: msg.text 
+            });
+        });
 
         let keepRunning = true;
         let loopCount = 0;
@@ -137,7 +199,7 @@ JSON Response Schema Options:
                     },
                     body: JSON.stringify({
                         model: 'llama-3.1-8b-instant',
-                        messages: this._chatHistory,
+                        messages: this._agentContextHistory,
                         temperature: 0.1,
                         response_format: { type: "json_object" }
                     })
@@ -149,7 +211,6 @@ JSON Response Schema Options:
                 const rawJsonText = data.choices[0].message.content.trim();
                 const agentDecision = JSON.parse(rawJsonText);
 
-                // 1. Handle READ action
                 if (agentDecision.action === 'read') {
                     this._panel.webview.postMessage({ command: 'status', text: `ai reading ${agentDecision.path}...` });
                     
@@ -167,14 +228,12 @@ JSON Response Schema Options:
                         fileContent = "Error: File not found.";
                     }
 
-                    this._chatHistory.push({ role: 'assistant', content: rawJsonText });
-                    this._chatHistory.push({ 
+                    this._agentContextHistory.push({ role: 'assistant', content: rawJsonText });
+                    this._agentContextHistory.push({ 
                         role: 'user', 
                         content: `File Content of ${agentDecision.path}:\n\n${fileContent}\n\nAnalyze this content for bugs and decide your next action.` 
                     });
                 } 
-                
-                // 2. Handle UPDATE action
                 else if (agentDecision.action === 'update') {
                     this._panel.webview.postMessage({ command: 'status', text: `ai updating ${agentDecision.path}...` });
                     
@@ -191,27 +250,19 @@ JSON Response Schema Options:
                     }
 
                     let fileContent = fs.readFileSync(fullPath, 'utf8');
-
-                    // Standardize string formatting for accurate evaluations
-                    const normalizeText = (text: string) => {
-                        return text.replace(/\r\n/g, '\n');
-                    };
+                    const normalizeText = (text: string) => text.replace(/\r\n/g, '\n');
 
                     const normalizedFileContent = normalizeText(fileContent);
                     const normalizedTarget = normalizeText(agentDecision.targetCode);
                     const normalizedReplacement = normalizeText(agentDecision.replacementCode);
 
-                    // --- Optimized String-based checking via includes ---
                     if (normalizedFileContent.includes(normalizedTarget)) {
-                        
-                        // Extract leading indentation spaces dynamically from the first matching instance's context
                         const targetIndex = normalizedFileContent.indexOf(normalizedTarget);
                         const lineStartIndex = normalizedFileContent.lastIndexOf('\n', targetIndex) + 1;
                         const matchingLinePrefix = normalizedFileContent.substring(lineStartIndex, targetIndex);
                         const indentationMatch = matchingLinePrefix.match(/^([ \t]*)/);
                         const baseIndentation = indentationMatch ? indentationMatch[1] : '';
 
-                        // Re-indent replacement code strings matching structure cleanly
                         const indentedReplacement = normalizedReplacement
                             .split('\n')
                             .map((line: string, idx: number) => {
@@ -221,20 +272,15 @@ JSON Response Schema Options:
                             })
                             .join('\n');
 
-                        // Replace targeted snippet
                         const updatedContent = normalizedFileContent.replace(normalizedTarget, indentedReplacement);
-                        
-                        // Commit to disk safely
                         fs.writeFileSync(fullPath, updatedContent, 'utf8');
-                        
                     } else {
-                        // Fallback literal replacement
                         if (fileContent.includes(agentDecision.targetCode)) {
                             fileContent = fileContent.replace(agentDecision.targetCode, agentDecision.replacementCode);
                             fs.writeFileSync(fullPath, fileContent, 'utf8');
                         } else {
-                            this._chatHistory.push({ role: 'assistant', content: rawJsonText });
-                            this._chatHistory.push({ 
+                            this._agentContextHistory.push({ role: 'assistant', content: rawJsonText });
+                            this._agentContextHistory.push({ 
                                 role: 'user', 
                                 content: `Error: The code block you provided in "targetCode" does not exactly match anything in the file. Please view the file again and provide an exact snippet match.` 
                             });
@@ -242,16 +288,20 @@ JSON Response Schema Options:
                         }
                     }
 
-                    this._chatHistory.push({ role: 'assistant', content: rawJsonText });
-                    this._chatHistory.push({ 
+                    this._agentContextHistory.push({ role: 'assistant', content: rawJsonText });
+                    this._agentContextHistory.push({ 
                         role: 'user', 
                         content: `Success: The file ${agentDecision.path} has been updated in the workspace. Now produce your final explanation summary using action 'final'.` 
                     });
                 } 
-                
-                // 3. Handle FINAL conclusion action
                 else if (agentDecision.action === 'final') {
-                    this._panel.webview.postMessage({ command: 'aiResponse', text: agentDecision.message });
+                    const aiTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                    
+                    // Display response in Panel UI
+                    this._panel.webview.postMessage({ command: 'aiResponse', text: agentDecision.message, timestamp: aiTime });
+                    
+                    // Commit final AI turn response log into local database
+                    this._saveMessageToDisk('assistant', agentDecision.message, aiTime);
                     keepRunning = false;
                 } else {
                     keepRunning = false;
@@ -293,7 +343,6 @@ JSON Response Schema Options:
                 .user-msg { align-self: flex-end; background-color: #FCE4EC; color: #2D2426; border-bottom-right-radius: 1px; }
                 .ai-msg { align-self: flex-start; background-color: #E3F2FD; color: #1A2E40; border-bottom-left-radius: 1px; }
                 
-                /* Keep standard body text inside messages clean but isolated from breaking code coloring rules */
                 .user-msg > span, .ai-msg > div { color: inherit; }
 
                 .msg-timestamp { font-size: 10px; opacity: 0.65; margin-top: 6px; font-weight: normal; align-self: flex-end; user-select: none; }
@@ -307,28 +356,18 @@ JSON Response Schema Options:
                 .error-msg { align-self: center; background-color: var(--vscode-inputValidation-errorBackground); color: var(--vscode-inputValidation-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder); font-size: 12px; border-radius: 4px; padding: 6px 12px; }
                 
                 .code-block-container { position: relative; margin: 8px 0; }
-                
-                /* FIX: Strict high-contrast styling overrides targeting dark code blocks to prevent layout inheritance color traps */
                 pre[class*="language-"], pre { background: #1e1e1e !important; padding: 32px 12px 12px 12px !important; border-radius: 6px; overflow-x: auto; margin: 0; border: 1px solid #333; }
                 code[class*="language-"], pre code { font-family: 'Courier New', monospace; font-size: 13px; text-shadow: none !important; }
                 
-                /* Explicitly define standard readable Prism token color highlights inside the bubble containers */
-                .message-wrapper pre code, 
-                .message-wrapper pre span,
-                .message-wrapper .token { text-shadow: none !important; }
-                
-                .message-wrapper .token.comment, .message-wrapper .token.prolog, .message-wrapper .token.doctype, .message-wrapper .token.cdata { color: #6a9955 !important; }
+                .message-wrapper pre code, .message-wrapper pre span, .message-wrapper .token { text-shadow: none !important; }
+                .message-wrapper .token.comment { color: #6a9955 !important; }
                 .message-wrapper .token.punctuation { color: #d4d4d4 !important; }
-                .message-wrapper .token.property, .message-wrapper .token.tag, .message-wrapper .token.boolean, .message-wrapper .token.number, .message-wrapper .token.constant, .message-wrapper .token.symbol, .message-wrapper .token.deleted { color: #b5cea8 !important; }
-                .message-wrapper .token.selector, .message-wrapper .token.attr-name, .message-wrapper .token.string, .message-wrapper .token.char, .message-wrapper .token.builtin, .message-wrapper .token.inserted { color: #ce9178 !important; }
-                .message-wrapper .token.operator, .message-wrapper .token.entity, .message-wrapper .token.url, .language-css .token.string, .style .token.string { color: #d4d4d4 !important; }
-                .message-wrapper .token.atrule, .message-wrapper .token.attr-value, .message-wrapper .token.keyword { color: #569cd6 !important; }
+                .message-wrapper .token.property, .message-wrapper .token.tag, .message-wrapper .token.number { color: #b5cea8 !important; }
+                .message-wrapper .token.selector, .message-wrapper .token.attr-name, .message-wrapper .token.string { color: #ce9178 !important; }
+                .message-wrapper .token.operator, .message-wrapper .token.keyword { color: #569cd6 !important; }
                 .message-wrapper .token.function, .message-wrapper .token.class-name { color: #dcdcaa !important; }
-                .message-wrapper .token.regex, .message-wrapper .token.important, .message-wrapper .token.variable { color: #d16969 !important; }
                 
-                /* Fallback global catch for basic plain text statements inside code fields */
                 .message-wrapper pre * { color: #f4f4f4; }
-
                 .copy-btn { position: absolute; top: 6px; right: 8px; background: rgba(255,255,255,0.15); color: #ffffff !important; border: none; padding: 3px 8px; font-size: 10px; border-radius: 3px; cursor: pointer; text-transform: uppercase; }
                 .copy-btn:hover { background: rgba(255,255,255,0.3); }
             </style>
@@ -359,6 +398,11 @@ JSON Response Schema Options:
 
                 marked.setOptions({ gfm: true, breaks: true });
 
+                // Let the extension know the UI is fully ready to display archived history logs
+                window.addEventListener('load', () => {
+                    vscode.postMessage({ command: 'initialized' });
+                });
+
                 saveKeyBtn.addEventListener('click', () => {
                     if(apiKeyInput.value) vscode.postMessage({ command: 'saveKey', key: apiKeyInput.value });
                 });
@@ -375,21 +419,51 @@ JSON Response Schema Options:
                     const text = userInput.value.trim();
                     if (!text) return;
                     
-                    const userDiv = document.createElement('div');
-                    userDiv.className = 'message-wrapper user-msg';
+                    const currentTime = getFormattedTime();
+                    appendMessageToUI('user', text, currentTime);
                     
-                    const textSpan = document.createElement('span');
-                    textSpan.textContent = text;
-                    userDiv.appendChild(textSpan);
+                    vscode.postMessage({ command: 'sendMessage', text: text, timestamp: currentTime });
+                    userInput.value = '';
+                }
+
+                function appendMessageToUI(role, text, timestamp) {
+                    const msgDiv = document.createElement('div');
+                    if (role === 'user') {
+                        msgDiv.className = 'message-wrapper user-msg';
+                        const textSpan = document.createElement('span');
+                        textSpan.textContent = text;
+                        msgDiv.appendChild(textSpan);
+                    } else {
+                        msgDiv.className = 'message-wrapper ai-msg';
+                        const contentDiv = document.createElement('div');
+                        contentDiv.innerHTML = marked.parse(text);
+                        msgDiv.appendChild(contentDiv);
+                        
+                        contentDiv.querySelectorAll('pre').forEach((preElement) => {
+                            const container = document.createElement('div');
+                            container.className = 'code-block-container';
+                            const codeText = preElement.querySelector('code')?.textContent || preElement.textContent;
+                            
+                            const copyBtn = document.createElement('button');
+                            copyBtn.className = 'copy-btn';
+                            copyBtn.textContent = 'COPY';
+                            copyBtn.addEventListener('click', () => copyToClipboard(codeText, copyBtn));
+                            
+                            preElement.parentNode.insertBefore(container, preElement);
+                            container.appendChild(preElement);
+                            container.appendChild(copyBtn);
+                        });
+                    }
                     
                     const timeDiv = document.createElement('div');
                     timeDiv.className = 'msg-timestamp';
-                    timeDiv.textContent = getFormattedTime();
-                    userDiv.appendChild(timeDiv);
+                    timeDiv.textContent = timestamp;
+                    msgDiv.appendChild(timeDiv);
 
-                    chatArea.appendChild(userDiv);
-                    vscode.postMessage({ command: 'sendMessage', text: text });
-                    userInput.value = '';
+                    chatArea.appendChild(msgDiv);
+                    if (role === 'assistant') {
+                        Prism.highlightAllUnder(msgDiv);
+                    }
                     chatArea.scrollTop = chatArea.scrollHeight;
                 }
 
@@ -404,40 +478,18 @@ JSON Response Schema Options:
                 window.addEventListener('message', event => {
                     const message = event.data;
                     switch (message.command) {
+                        case 'loadHistory':
+                            chatArea.innerHTML = ''; // clear initial screen
+                            message.history.forEach(msg => {
+                                appendMessageToUI(msg.role, msg.text, msg.timestamp);
+                            });
+                            break;
                         case 'status':
                             statusTracker.textContent = message.text;
                             break;
                         case 'aiResponse':
                             statusTracker.textContent = '';
-                            const aiDiv = document.createElement('div');
-                            aiDiv.className = 'message-wrapper ai-msg';
-                            
-                            const contentDiv = document.createElement('div');
-                            contentDiv.innerHTML = marked.parse(message.text);
-                            aiDiv.appendChild(contentDiv);
-                            
-                            aiDiv.querySelectorAll('pre').forEach((preElement) => {
-                                const container = document.createElement('div');
-                                container.className = 'code-block-container';
-                                const codeText = preElement.querySelector('code')?.textContent || preElement.textContent;
-                                
-                                const copyBtn = document.createElement('button');
-                                copyBtn.className = 'copy-btn';
-                                copyBtn.textContent = 'COPY';
-                                copyBtn.addEventListener('click', () => copyToClipboard(codeText, copyBtn));
-                                
-                                preElement.parentNode.insertBefore(container, preElement);
-                                container.appendChild(preElement);
-                                container.appendChild(copyBtn);
-                            });
-
-                            const timeDiv = document.createElement('div');
-                            timeDiv.className = 'msg-timestamp';
-                            timeDiv.textContent = getFormattedTime();
-                            aiDiv.appendChild(timeDiv);
-
-                            chatArea.appendChild(aiDiv);
-                            Prism.highlightAllUnder(aiDiv);
+                            appendMessageToUI('assistant', message.text, message.timestamp);
                             break;
                         case 'error':
                             statusTracker.textContent = '';
@@ -445,9 +497,9 @@ JSON Response Schema Options:
                             errDiv.className = 'error-msg';
                             errDiv.textContent = message.text;
                             chatArea.appendChild(errDiv);
+                            chatArea.scrollTop = chatArea.scrollHeight;
                             break;
                     }
-                    chatArea.scrollTop = chatArea.scrollHeight;
                 });
             </script>
         </body>
