@@ -69,11 +69,27 @@ class ChatPanel {
 
     // Agent Engine Loop
     private async _runAgentEngine(userMessage: string) {
+        // --- Scenario B Hardcoded Logic Guardrail ---
+        const lowerMessage = userMessage.toLowerCase();
+        const restrictedKeywords = [
+            'medicine', 'prescription', 'doctor', 'medical', 'headache', 'migraine', 
+            'pill', 'tablet', 'symptom', 'disease', 'diagnosis', 'therapy', 'drug'
+        ];
+        
+        const containsRestricted = restrictedKeywords.some(keyword => lowerMessage.includes(keyword));
+        if (containsRestricted) {
+            const blockedResponse = "I am optimized exclusively for computer science, software engineering, and programming inquiries. I cannot provide assistance on this topic.";
+            this._panel.webview.postMessage({ command: 'aiResponse', text: blockedResponse });
+            return;
+        }
+        // ---------------------------------------------
+
         // Reset chat history tracking for a clean task run loop
         this._chatHistory = [];
         
-        const systemPrompt = `You are an elite Software Engineering Agent. Your task is to analyze user requests and interact with local workspace files using automated thoughts.
-
+        const systemPrompt = `You are an elite Software Engineering Agent. Your task is to analyze user requests and interact with local workspace files using automated thoughts. 
+CRITICAL FOCUS & SCOPE RULE:
+You are optimized exclusively for computer science, software engineering, IT, and programming inquiries. If a user asks a question outside of this technical scope (such as medicine, law, history, cooking, etc.), you MUST decline to answer. In such cases, ignore the tool-calling options and return a final response stating: "I am optimized exclusively for computer science, software engineering, and programming inquiries. I cannot provide assistance on out-of-scope topics."
 CRITICAL FORMATTING RULE:
 You must ALWAYS respond in a strict JSON format. Do not include any text outside the JSON object. Do not use markdown blocks (\`\`\`json) in your overall response. Just return the raw JSON object.
 
@@ -91,7 +107,7 @@ JSON Response Schema Options:
     "action": "update",
     "path": "relative/path/to/file.ext",
     "targetCode": "EXACT target code string currently in the file that has the error",
-    "replacementCode": "The new corrected code string to swap in",
+    "replacementCode": "The new corrected code string to swap in. Indent it cleanly using relative spaces matching the structure.",
     "thought": "Explanation of the logical bug you are fixing"
 }
 
@@ -106,7 +122,7 @@ JSON Response Schema Options:
 
         let keepRunning = true;
         let loopCount = 0;
-        const maxLoops = 5; // Guardrail to prevent infinite API loops
+        const maxLoops = 5;
 
         while (keepRunning && loopCount < maxLoops) {
             loopCount++;
@@ -123,7 +139,7 @@ JSON Response Schema Options:
                         model: 'llama-3.1-8b-instant',
                         messages: this._chatHistory,
                         temperature: 0.1,
-                        response_format: { type: "json_object" } // Enforces strict JSON output from Groq
+                        response_format: { type: "json_object" }
                     })
                 });
 
@@ -151,7 +167,6 @@ JSON Response Schema Options:
                         fileContent = "Error: File not found.";
                     }
 
-                    // Feed file content back to the AI context memory loop
                     this._chatHistory.push({ role: 'assistant', content: rawJsonText });
                     this._chatHistory.push({ 
                         role: 'user', 
@@ -159,7 +174,7 @@ JSON Response Schema Options:
                     });
                 } 
                 
-                // 2. Handle UPDATE action (Surgical, robust search-and-replace)
+                // 2. Handle UPDATE action
                 else if (agentDecision.action === 'update') {
                     this._panel.webview.postMessage({ command: 'status', text: `ai updating ${agentDecision.path}...` });
                     
@@ -175,15 +190,13 @@ JSON Response Schema Options:
                         return;
                     }
 
-                    // Read original content
                     let fileContent = fs.readFileSync(fullPath, 'utf8');
 
-                    // Helper function to normalize line endings and trim whitespace around lines
                     const normalizeText = (text: string) => {
                         return text
-                            .replace(/\r\n/g, '\n') // Convert Windows CRLF to standard LF
+                            .replace(/\r\n/g, '\n')
                             .split('\n')
-                            .map(line => line.trimEnd()) // Remove trailing spaces from each line
+                            .map(line => line.trimEnd())
                             .join('\n')
                             .trim();
                     };
@@ -192,15 +205,12 @@ JSON Response Schema Options:
                     const normalizedTarget = normalizeText(agentDecision.targetCode);
                     const normalizedReplacement = agentDecision.replacementCode.replace(/\r\n/g, '\n');
 
-                    // Strategy 1: Attempt exact match check on normalized structures
                     if (normalizedFileContent.includes(normalizedTarget)) {
-                        // To accurately preserve the user's specific indentation style, 
-                        // we split the file and search for the block sequence
                         const fileLines = fileContent.replace(/\r\n/g, '\n').split('\n');
-                        const targetLines = agentDecision.targetCode.replace(/\r\n/g, '\n').split('\n').map((l: string) => l.trim());                        
+                        const targetLines = agentDecision.targetCode.replace(/\r\n/g, '\n').split('\n').map((l: string) => l.trim());
+                        
                         let matchIndex = -1;
                         
-                        // Scan file lines to find where the trimmed versions match sequentially
                         for (let i = 0; i <= fileLines.length - targetLines.length; i++) {
                             let matches = true;
                             for (let j = 0; j < targetLines.length; j++) {
@@ -216,28 +226,29 @@ JSON Response Schema Options:
                         }
 
                         if (matchIndex !== -1) {
-                            // Detect the base indentation of the original code block
                             const originalFirstLine = fileLines[matchIndex];
                             const indentationMatch = originalFirstLine.match(/^([ \t]*)/);
                             const baseIndentation = indentationMatch ? indentationMatch[1] : '';
 
-                            // Apply that exact indentation style to the incoming replacement rows
+                            // Formats lines while strictly maintaining the native indentation spaces 
                             const indentedReplacement = normalizedReplacement
                                 .split('\n')
-                                .map((line: string, idx: number) => idx === 0 ? line : baseIndentation + line)
+                                .map((line: string) => {
+                                    if (line.trim() === '') return '';
+                                    // If the line already contains some indentation layout from the AI, respect it relative to base
+                                    const lineIndentMatch = line.match(/^([ \t]*)/);
+                                    const internalIndent = lineIndentMatch ? lineIndentMatch[1] : '';
+                                    return baseIndentation + internalIndent + line.trim();
+                                })
                                 .join('\n');
 
-                            // Splice the old block out and insert the new one
                             fileLines.splice(matchIndex, targetLines.length, indentedReplacement);
                             fs.writeFileSync(fullPath, fileLines.join('\n'), 'utf8');
                         } else {
-                            // Fallback direct string replacement if line parsing behaves unexpectedly
                             fileContent = fileContent.replace(agentDecision.targetCode, agentDecision.replacementCode);
                             fs.writeFileSync(fullPath, fileContent, 'utf8');
                         }
                     } else {
-                        // Strategy 2: Absolute Fallback if AI missed exact match context strings completely
-                        // We ask the AI to try again with a cleaner block structure context
                         this._chatHistory.push({ role: 'assistant', content: rawJsonText });
                         this._chatHistory.push({ 
                             role: 'user', 
@@ -246,13 +257,12 @@ JSON Response Schema Options:
                         continue;
                     }
 
-                    // Notify AI that file modification was an absolute success
                     this._chatHistory.push({ role: 'assistant', content: rawJsonText });
                     this._chatHistory.push({ 
                         role: 'user', 
                         content: `Success: The file ${agentDecision.path} has been updated in the workspace. Now produce your final explanation summary using action 'final'.` 
                     });
-                }
+                } 
                 
                 // 3. Handle FINAL conclusion action
                 else if (agentDecision.action === 'final') {
@@ -290,8 +300,14 @@ JSON Response Schema Options:
                 .config-container button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
                 #chat-area { flex: 1; overflow-y: auto; padding-right: 4px; margin-bottom: 15px; display: flex; flex-direction: column; gap: 12px; }
                 .message-wrapper { display: flex; flex-direction: column; max-width: 85%; padding: 12px 16px; border-radius: 8px; font-size: 13px; line-height: 1.5; position: relative; }
-                .user-msg { align-self: flex-end; background-color: #FCE4EC; color: #263238; border-bottom-right-radius: 1px; }
-                .ai-msg { align-self: flex-start; background-color: #E3F2FD; color: #263238; border-bottom-left-radius: 1px; }
+                
+                /* Styled Text to Deep Charcoal Brown for contrast legibility */
+                .user-msg { align-self: flex-end; background-color: #FCE4EC; color: #2D2426; border-bottom-right-radius: 1px; }
+                .ai-msg { align-self: flex-start; background-color: #E3F2FD; color: #1A2E40; border-bottom-left-radius: 1px; }
+                
+                /* Ensure all child headings, markdown text elements match high contrast rules */
+                .user-msg *, .ai-msg * { color: inherit !important; }
+
                 #status-tracker { font-size: 11px; font-style: italic; color: var(--vscode-descriptionForeground); padding: 4px; margin-bottom: 4px; text-transform: lowercase; }
                 .input-container { display: flex; gap: 8px; padding: 10px 0; }
                 #user-input { flex: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 10px; border-radius: 4px; height: 36px; resize: none; }
@@ -300,7 +316,10 @@ JSON Response Schema Options:
                 
                 .code-block-container { position: relative; margin: 8px 0; }
                 pre { background: #1e1e1e !important; padding: 32px 12px 12px 12px !important; border-radius: 6px; overflow-x: auto; margin: 0; }
-                .copy-btn { position: absolute; top: 6px; right: 8px; background: rgba(255,255,255,0.15); color: #ffffff; border: none; padding: 3px 8px; font-size: 10px; border-radius: 3px; cursor: pointer; text-transform: uppercase; }
+                
+                /* High contrast text color properties inside prism elements */
+                pre code, pre span { color: #fff !important; font-family: 'Courier New', monospace; }
+                .copy-btn { position: absolute; top: 6px; right: 8px; background: rgba(255,255,255,0.15); color: #ffffff !important; border: none; padding: 3px 8px; font-size: 10px; border-radius: 3px; cursor: pointer; text-transform: uppercase; }
                 .copy-btn:hover { background: rgba(255,255,255,0.3); }
             </style>
         </head>
