@@ -192,69 +192,54 @@ JSON Response Schema Options:
 
                     let fileContent = fs.readFileSync(fullPath, 'utf8');
 
+                    // Standardize string formatting for accurate evaluations
                     const normalizeText = (text: string) => {
-                        return text
-                            .replace(/\r\n/g, '\n')
-                            .split('\n')
-                            .map(line => line.trimEnd())
-                            .join('\n')
-                            .trim();
+                        return text.replace(/\r\n/g, '\n');
                     };
 
                     const normalizedFileContent = normalizeText(fileContent);
                     const normalizedTarget = normalizeText(agentDecision.targetCode);
-                    const normalizedReplacement = agentDecision.replacementCode.replace(/\r\n/g, '\n');
+                    const normalizedReplacement = normalizeText(agentDecision.replacementCode);
 
+                    // --- Optimized String-based checking via includes ---
                     if (normalizedFileContent.includes(normalizedTarget)) {
-                        const fileLines = fileContent.replace(/\r\n/g, '\n').split('\n');
-                        const targetLines = agentDecision.targetCode.replace(/\r\n/g, '\n').split('\n').map((l: string) => l.trim());
                         
-                        let matchIndex = -1;
+                        // Extract leading indentation spaces dynamically from the first matching instance's context
+                        const targetIndex = normalizedFileContent.indexOf(normalizedTarget);
+                        const lineStartIndex = normalizedFileContent.lastIndexOf('\n', targetIndex) + 1;
+                        const matchingLinePrefix = normalizedFileContent.substring(lineStartIndex, targetIndex);
+                        const indentationMatch = matchingLinePrefix.match(/^([ \t]*)/);
+                        const baseIndentation = indentationMatch ? indentationMatch[1] : '';
+
+                        // Re-indent replacement code strings matching structure cleanly
+                        const indentedReplacement = normalizedReplacement
+                            .split('\n')
+                            .map((line: string, idx: number) => {
+                                if (line.trim() === '') return '';
+                                if (idx === 0) return line; 
+                                return baseIndentation + line;
+                            })
+                            .join('\n');
+
+                        // Replace targeted snippet
+                        const updatedContent = normalizedFileContent.replace(normalizedTarget, indentedReplacement);
                         
-                        for (let i = 0; i <= fileLines.length - targetLines.length; i++) {
-                            let matches = true;
-                            for (let j = 0; j < targetLines.length; j++) {
-                                if (fileLines[i + j].trim() !== targetLines[j]) {
-                                    matches = false;
-                                    break;
-                                }
-                            }
-                            if (matches) {
-                                matchIndex = i;
-                                break;
-                            }
-                        }
-
-                        if (matchIndex !== -1) {
-                            const originalFirstLine = fileLines[matchIndex];
-                            const indentationMatch = originalFirstLine.match(/^([ \t]*)/);
-                            const baseIndentation = indentationMatch ? indentationMatch[1] : '';
-
-                            // Formats lines while strictly maintaining the native indentation spaces 
-                            const indentedReplacement = normalizedReplacement
-                                .split('\n')
-                                .map((line: string) => {
-                                    if (line.trim() === '') return '';
-                                    // If the line already contains some indentation layout from the AI, respect it relative to base
-                                    const lineIndentMatch = line.match(/^([ \t]*)/);
-                                    const internalIndent = lineIndentMatch ? lineIndentMatch[1] : '';
-                                    return baseIndentation + internalIndent + line.trim();
-                                })
-                                .join('\n');
-
-                            fileLines.splice(matchIndex, targetLines.length, indentedReplacement);
-                            fs.writeFileSync(fullPath, fileLines.join('\n'), 'utf8');
-                        } else {
+                        // Commit to disk safely
+                        fs.writeFileSync(fullPath, updatedContent, 'utf8');
+                        
+                    } else {
+                        // Fallback literal replacement
+                        if (fileContent.includes(agentDecision.targetCode)) {
                             fileContent = fileContent.replace(agentDecision.targetCode, agentDecision.replacementCode);
                             fs.writeFileSync(fullPath, fileContent, 'utf8');
+                        } else {
+                            this._chatHistory.push({ role: 'assistant', content: rawJsonText });
+                            this._chatHistory.push({ 
+                                role: 'user', 
+                                content: `Error: The code block you provided in "targetCode" does not exactly match anything in the file. Please view the file again and provide an exact snippet match.` 
+                            });
+                            continue;
                         }
-                    } else {
-                        this._chatHistory.push({ role: 'assistant', content: rawJsonText });
-                        this._chatHistory.push({ 
-                            role: 'user', 
-                            content: `Error: The code block you provided in "targetCode" does not exactly match anything in the file. Please view the file again and provide an exact snippet match.` 
-                        });
-                        continue;
                     }
 
                     this._chatHistory.push({ role: 'assistant', content: rawJsonText });
@@ -295,18 +280,25 @@ JSON Response Schema Options:
             <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-autoloader.min.js"></script>
             <style>
                 body { font-family: -apple-system, sans-serif; padding: 15px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; background-color: var(--vscode-editor-background); color: var(--vscode-editor-foreground); margin: 0; }
+                
+                .chat-header { padding-bottom: 10px; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 12px; }
+                .chat-header h2 { margin: 0; font-size: 16px; font-weight: 600; color: var(--vscode-settings-headerForeground, var(--vscode-editor-foreground)); letter-spacing: 0.3px; }
+                
                 .config-container { display: flex; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-panel-border); margin-bottom: 12px; }
                 .config-container input { flex: 1; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px 10px; border-radius: 4px; font-size: 12px; }
                 .config-container button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-                #chat-area { flex: 1; overflow-y: auto; padding-right: 4px; margin-bottom: 15px; display: flex; flex-direction: column; gap: 12px; }
-                .message-wrapper { display: flex; flex-direction: column; max-width: 85%; padding: 12px 16px; border-radius: 8px; font-size: 13px; line-height: 1.5; position: relative; }
+                #chat-area { flex: 1; overflow-y: auto; padding-right: 4px; margin-bottom: 15px; display: flex; flex-direction: column; gap: 14px; }
                 
-                /* Styled Text to Deep Charcoal Brown for contrast legibility */
+                .message-wrapper { display: flex; flex-direction: column; max-width: 85%; padding: 12px 16px; border-radius: 8px; font-size: 13px; line-height: 1.5; position: relative; }
                 .user-msg { align-self: flex-end; background-color: #FCE4EC; color: #2D2426; border-bottom-right-radius: 1px; }
                 .ai-msg { align-self: flex-start; background-color: #E3F2FD; color: #1A2E40; border-bottom-left-radius: 1px; }
                 
-                /* Ensure all child headings, markdown text elements match high contrast rules */
-                .user-msg *, .ai-msg * { color: inherit !important; }
+                /* Keep standard body text inside messages clean but isolated from breaking code coloring rules */
+                .user-msg > span, .ai-msg > div { color: inherit; }
+
+                .msg-timestamp { font-size: 10px; opacity: 0.65; margin-top: 6px; font-weight: normal; align-self: flex-end; user-select: none; }
+                .user-msg .msg-timestamp { color: #5D4037 !important; }
+                .ai-msg .msg-timestamp { color: #546E7A !important; }
 
                 #status-tracker { font-size: 11px; font-style: italic; color: var(--vscode-descriptionForeground); padding: 4px; margin-bottom: 4px; text-transform: lowercase; }
                 .input-container { display: flex; gap: 8px; padding: 10px 0; }
@@ -315,15 +307,37 @@ JSON Response Schema Options:
                 .error-msg { align-self: center; background-color: var(--vscode-inputValidation-errorBackground); color: var(--vscode-inputValidation-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder); font-size: 12px; border-radius: 4px; padding: 6px 12px; }
                 
                 .code-block-container { position: relative; margin: 8px 0; }
-                pre { background: #1e1e1e !important; padding: 32px 12px 12px 12px !important; border-radius: 6px; overflow-x: auto; margin: 0; }
                 
-                /* High contrast text color properties inside prism elements */
-                pre code, pre span { color: #fff !important; font-family: 'Courier New', monospace; }
+                /* FIX: Strict high-contrast styling overrides targeting dark code blocks to prevent layout inheritance color traps */
+                pre[class*="language-"], pre { background: #1e1e1e !important; padding: 32px 12px 12px 12px !important; border-radius: 6px; overflow-x: auto; margin: 0; border: 1px solid #333; }
+                code[class*="language-"], pre code { font-family: 'Courier New', monospace; font-size: 13px; text-shadow: none !important; }
+                
+                /* Explicitly define standard readable Prism token color highlights inside the bubble containers */
+                .message-wrapper pre code, 
+                .message-wrapper pre span,
+                .message-wrapper .token { text-shadow: none !important; }
+                
+                .message-wrapper .token.comment, .message-wrapper .token.prolog, .message-wrapper .token.doctype, .message-wrapper .token.cdata { color: #6a9955 !important; }
+                .message-wrapper .token.punctuation { color: #d4d4d4 !important; }
+                .message-wrapper .token.property, .message-wrapper .token.tag, .message-wrapper .token.boolean, .message-wrapper .token.number, .message-wrapper .token.constant, .message-wrapper .token.symbol, .message-wrapper .token.deleted { color: #b5cea8 !important; }
+                .message-wrapper .token.selector, .message-wrapper .token.attr-name, .message-wrapper .token.string, .message-wrapper .token.char, .message-wrapper .token.builtin, .message-wrapper .token.inserted { color: #ce9178 !important; }
+                .message-wrapper .token.operator, .message-wrapper .token.entity, .message-wrapper .token.url, .language-css .token.string, .style .token.string { color: #d4d4d4 !important; }
+                .message-wrapper .token.atrule, .message-wrapper .token.attr-value, .message-wrapper .token.keyword { color: #569cd6 !important; }
+                .message-wrapper .token.function, .message-wrapper .token.class-name { color: #dcdcaa !important; }
+                .message-wrapper .token.regex, .message-wrapper .token.important, .message-wrapper .token.variable { color: #d16969 !important; }
+                
+                /* Fallback global catch for basic plain text statements inside code fields */
+                .message-wrapper pre * { color: #f4f4f4; }
+
                 .copy-btn { position: absolute; top: 6px; right: 8px; background: rgba(255,255,255,0.15); color: #ffffff !important; border: none; padding: 3px 8px; font-size: 10px; border-radius: 3px; cursor: pointer; text-transform: uppercase; }
                 .copy-btn:hover { background: rgba(255,255,255,0.3); }
             </style>
         </head>
         <body>
+            <div class="chat-header">
+                <h2>CSE Code Buddy — Chat Workspace</h2>
+            </div>
+
             <div class="config-container">
                 <input type="password" id="api-key-input" placeholder="Enter Groq API Key here..." />
                 <button id="save-key-btn">Save Key</button>
@@ -352,12 +366,27 @@ JSON Response Schema Options:
                 sendBtn.addEventListener('click', sendMessage);
                 userInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
 
+                function getFormattedTime() {
+                    const now = new Date();
+                    return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                }
+
                 function sendMessage() {
                     const text = userInput.value.trim();
                     if (!text) return;
+                    
                     const userDiv = document.createElement('div');
                     userDiv.className = 'message-wrapper user-msg';
-                    userDiv.textContent = text;
+                    
+                    const textSpan = document.createElement('span');
+                    textSpan.textContent = text;
+                    userDiv.appendChild(textSpan);
+                    
+                    const timeDiv = document.createElement('div');
+                    timeDiv.className = 'msg-timestamp';
+                    timeDiv.textContent = getFormattedTime();
+                    userDiv.appendChild(timeDiv);
+
                     chatArea.appendChild(userDiv);
                     vscode.postMessage({ command: 'sendMessage', text: text });
                     userInput.value = '';
@@ -382,7 +411,10 @@ JSON Response Schema Options:
                             statusTracker.textContent = '';
                             const aiDiv = document.createElement('div');
                             aiDiv.className = 'message-wrapper ai-msg';
-                            aiDiv.innerHTML = marked.parse(message.text);
+                            
+                            const contentDiv = document.createElement('div');
+                            contentDiv.innerHTML = marked.parse(message.text);
+                            aiDiv.appendChild(contentDiv);
                             
                             aiDiv.querySelectorAll('pre').forEach((preElement) => {
                                 const container = document.createElement('div');
@@ -398,6 +430,11 @@ JSON Response Schema Options:
                                 container.appendChild(preElement);
                                 container.appendChild(copyBtn);
                             });
+
+                            const timeDiv = document.createElement('div');
+                            timeDiv.className = 'msg-timestamp';
+                            timeDiv.textContent = getFormattedTime();
+                            aiDiv.appendChild(timeDiv);
 
                             chatArea.appendChild(aiDiv);
                             Prism.highlightAllUnder(aiDiv);
